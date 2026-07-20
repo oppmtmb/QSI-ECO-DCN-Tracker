@@ -200,10 +200,19 @@ if (process.env.NODE_ENV !== "production") {
 // Ledger state now lives in Google Sheets (source of truth) instead of a local file —
 // Cloud Run's filesystem is ephemeral and not shared across instances, so a local file
 // would silently lose data on every redeploy or when the service scales past 1 replica.
-// We store the full ledger blob (emails/matches/overrides) as a single JSON cell in a
-// dedicated, hidden-by-convention tab so the existing save/load API shape is unchanged.
+// We store the full ledger blob (emails/matches/overrides) as JSON, chunked across
+// multiple cells in column A because a single Sheets cell caps out at 50,000 characters.
 const LEDGER_SPREADSHEET_ID = process.env.LEDGER_SPREADSHEET_ID || "15Mj6A4XAj42T92ddmbgbW-lT6ulgzkc_qx2fHp0YT0c";
 const LEDGER_SHEET_TAB = "_LedgerState";
+const LEDGER_CELL_CHUNK_SIZE = 45000; // stay safely under the 50,000-char Sheets cell limit
+
+function chunkString(str: string, size: number): string[] {
+  const chunks: string[] = [];
+  for (let i = 0; i < str.length; i += size) {
+    chunks.push(str.substring(i, i + size));
+  }
+  return chunks.length > 0 ? chunks : [""];
+}
 
 async function ensureLedgerSheetExists(sheets: any) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: LEDGER_SPREADSHEET_ID });
@@ -220,13 +229,15 @@ async function ensureLedgerSheetExists(sheets: any) {
   }
 }
 
-// API Route: Save Shared Ledger State (writes to Google Sheets)
+// API Route: Save Shared Ledger State (writes to Google Sheets, chunked across cells)
 app.post("/api/ledger", async (req, res) => {
   try {
     const { emails, matches, overrides } = req.body;
     const timestamp = new Date().toISOString();
 
     const ledgerData = { emails, matches, overrides, updatedAt: timestamp };
+    const serialized = JSON.stringify(ledgerData);
+    const chunks = chunkString(serialized, LEDGER_CELL_CHUNK_SIZE);
 
     let sheets;
     try {
@@ -239,11 +250,18 @@ app.post("/api/ledger", async (req, res) => {
     }
 
     await ensureLedgerSheetExists(sheets);
+
+    // Clear the column first so a shorter payload doesn't leave stale trailing chunks
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: LEDGER_SPREADSHEET_ID,
+      range: `${LEDGER_SHEET_TAB}!A:A`,
+    });
+
     await sheets.spreadsheets.values.update({
       spreadsheetId: LEDGER_SPREADSHEET_ID,
       range: `${LEDGER_SHEET_TAB}!A1`,
       valueInputOption: "RAW",
-      requestBody: { values: [[JSON.stringify(ledgerData)]] },
+      requestBody: { values: chunks.map((c) => [c]) },
     });
 
     res.json({
@@ -259,7 +277,7 @@ app.post("/api/ledger", async (req, res) => {
   }
 });
 
-// API Route: Load Shared Ledger State (reads from Google Sheets)
+// API Route: Load Shared Ledger State (reads from Google Sheets, reassembles chunks)
 app.get("/api/ledger", async (req, res) => {
   try {
     let sheets;
@@ -275,12 +293,17 @@ app.get("/api/ledger", async (req, res) => {
     await ensureLedgerSheetExists(sheets);
     const result = await sheets.spreadsheets.values.get({
       spreadsheetId: LEDGER_SPREADSHEET_ID,
-      range: `${LEDGER_SHEET_TAB}!A1`,
+      range: `${LEDGER_SHEET_TAB}!A:A`,
     });
 
-    const raw = result.data.values?.[0]?.[0];
-    if (!raw) {
+    const rows = result.data.values;
+    if (!rows || rows.length === 0) {
       return res.json(null); // No ledger saved yet
+    }
+
+    const raw = rows.map((r: any[]) => r[0] || "").join("");
+    if (!raw) {
+      return res.json(null);
     }
 
     res.json(JSON.parse(raw));
