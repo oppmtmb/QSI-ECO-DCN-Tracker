@@ -1,12 +1,12 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
-import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { google } from "googleapis";
 
 const app = express();
-const PORT = 3000;
+// Cloud Run injects PORT automatically (usually 8080). Fall back to 8080 for local/dev parity.
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -38,7 +38,7 @@ function cleanPrivateKey(rawKey: string | undefined): string | undefined {
     console.log("[cleanPrivateKey] rawKey is undefined or empty");
     return undefined;
   }
-  
+
   let key = rawKey.trim();
   console.log(`[cleanPrivateKey] Input key length: ${key.length}`);
   console.log(`[cleanPrivateKey] Input starts with: "${key.substring(0, 30)}..."`);
@@ -65,7 +65,7 @@ function cleanPrivateKey(rawKey: string | undefined): string | undefined {
   while (key !== prevKey) {
     prevKey = key;
     key = key.trim();
-    
+
     // Remove leading/trailing matching quotes
     if (key.startsWith('"') && key.endsWith('"')) {
       key = key.substring(1, key.length - 1);
@@ -77,7 +77,7 @@ function cleanPrivateKey(rawKey: string | undefined): string | undefined {
       console.log(`[cleanPrivateKey] Stripped matching single quotes. New length: ${key.length}`);
       continue;
     }
-    
+
     // Remove trailing comma (often copied from JSON)
     if (key.endsWith(',')) {
       key = key.substring(0, key.length - 1).trim();
@@ -96,7 +96,7 @@ function cleanPrivateKey(rawKey: string | undefined): string | undefined {
       console.log(`[cleanPrivateKey] Stripped unmatched leading single quote. New length: ${key.length}`);
       continue;
     }
-    
+
     // Remove unmatched trailing quotes
     if (key.endsWith('"')) {
       key = key.substring(0, key.length - 1);
@@ -172,73 +172,123 @@ app.get("/api/sheets/config", (req, res) => {
 });
 
 // API Route: Safe diagnostic endpoint for private key format (no secret values returned)
-app.get("/api/debug-key", (req, res) => {
-  const rawKey = process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY;
-  if (!rawKey) {
-    return res.json({ error: "Key is undefined or empty" });
+// Guarded: only available outside production so it can't leak key metadata on the live deployment.
+if (process.env.NODE_ENV !== "production") {
+  app.get("/api/debug-key", (req, res) => {
+    const rawKey = process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY;
+    if (!rawKey) {
+      return res.json({ error: "Key is undefined or empty" });
+    }
+
+    const cleaned = cleanPrivateKey(rawKey);
+    const info = {
+      lengthRaw: rawKey.length,
+      lengthCleaned: cleaned ? cleaned.length : 0,
+      startsWithRaw: rawKey.substring(0, 40),
+      endsWithRaw: rawKey.substring(Math.max(0, rawKey.length - 40)),
+      startsWithCleaned: cleaned ? cleaned.substring(0, 40) : null,
+      endsWithCleaned: cleaned ? cleaned.substring(Math.max(0, cleaned?.length ? cleaned.length - 40 : 0)) : null,
+      containsEscapedN: rawKey.includes("\\n"),
+      containsActualN: rawKey.includes("\n"),
+      hasBeginHeader: cleaned ? (cleaned.includes("-----BEGIN PRIVATE KEY-----") || cleaned.includes("-----BEGIN RSA PRIVATE KEY-----")) : false,
+      hasEndHeader: cleaned ? (cleaned.includes("-----END PRIVATE KEY-----") || cleaned.includes("-----END RSA PRIVATE KEY-----")) : false,
+    };
+    res.json(info);
+  });
+}
+
+// Ledger state now lives in Google Sheets (source of truth) instead of a local file —
+// Cloud Run's filesystem is ephemeral and not shared across instances, so a local file
+// would silently lose data on every redeploy or when the service scales past 1 replica.
+// We store the full ledger blob (emails/matches/overrides) as a single JSON cell in a
+// dedicated, hidden-by-convention tab so the existing save/load API shape is unchanged.
+const LEDGER_SPREADSHEET_ID = process.env.LEDGER_SPREADSHEET_ID || "15Mj6A4XAj42T92ddmbgbW-lT6ulgzkc_qx2fHp0YT0c";
+const LEDGER_SHEET_TAB = "_LedgerState";
+
+async function ensureLedgerSheetExists(sheets: any) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: LEDGER_SPREADSHEET_ID });
+  const exists = (meta.data.sheets || []).some(
+    (s: any) => s.properties?.title === LEDGER_SHEET_TAB
+  );
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: LEDGER_SPREADSHEET_ID,
+      requestBody: {
+        requests: [{ addSheet: { properties: { title: LEDGER_SHEET_TAB } } }],
+      },
+    });
   }
-  
-  const cleaned = cleanPrivateKey(rawKey);
-  const info = {
-    lengthRaw: rawKey.length,
-    lengthCleaned: cleaned ? cleaned.length : 0,
-    startsWithRaw: rawKey.substring(0, 40),
-    endsWithRaw: rawKey.substring(Math.max(0, rawKey.length - 40)),
-    startsWithCleaned: cleaned ? cleaned.substring(0, 40) : null,
-    endsWithCleaned: cleaned ? cleaned.substring(Math.max(0, cleaned?.length ? cleaned.length - 40 : 0)) : null,
-    containsEscapedN: rawKey.includes("\\n"),
-    containsActualN: rawKey.includes("\n"),
-    hasBeginHeader: cleaned ? (cleaned.includes("-----BEGIN PRIVATE KEY-----") || cleaned.includes("-----BEGIN RSA PRIVATE KEY-----")) : false,
-    hasEndHeader: cleaned ? (cleaned.includes("-----END PRIVATE KEY-----") || cleaned.includes("-----END RSA PRIVATE KEY-----")) : false,
-  };
-  res.json(info);
-});
+}
 
-// Path to store ledger state locally on the server
-const LEDGER_FILE_PATH = path.join(process.cwd(), "shared_ledger.json");
-
-// API Route: Save Shared Ledger State
-app.post("/api/ledger", (req, res) => {
+// API Route: Save Shared Ledger State (writes to Google Sheets)
+app.post("/api/ledger", async (req, res) => {
   try {
     const { emails, matches, overrides } = req.body;
     const timestamp = new Date().toISOString();
-    
-    const ledgerData = {
-      emails,
-      matches,
-      overrides,
-      updatedAt: timestamp,
-    };
 
-    fs.writeFileSync(LEDGER_FILE_PATH, JSON.stringify(ledgerData, null, 2), "utf8");
-    
+    const ledgerData = { emails, matches, overrides, updatedAt: timestamp };
+
+    let sheets;
+    try {
+      sheets = getSheetsClient();
+    } catch (authError: any) {
+      return res.status(412).json({
+        error: "AUTHENTICATION_FAILED",
+        message: authError.message,
+      });
+    }
+
+    await ensureLedgerSheetExists(sheets);
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: LEDGER_SPREADSHEET_ID,
+      range: `${LEDGER_SHEET_TAB}!A1`,
+      valueInputOption: "RAW",
+      requestBody: { values: [[JSON.stringify(ledgerData)]] },
+    });
+
     res.json({
       success: true,
       updatedAt: timestamp,
     });
   } catch (error: any) {
-    console.error("Error saving ledger to server:", error);
+    console.error("Error saving ledger to Google Sheets:", error);
     res.status(500).json({
       error: "SAVE_FAILED",
-      message: error.message || "Failed to save ledger on the server.",
+      message: error.message || "Failed to save ledger to Google Sheets.",
     });
   }
 });
 
-// API Route: Load Shared Ledger State
-app.get("/api/ledger", (req, res) => {
+// API Route: Load Shared Ledger State (reads from Google Sheets)
+app.get("/api/ledger", async (req, res) => {
   try {
-    if (fs.existsSync(LEDGER_FILE_PATH)) {
-      const raw = fs.readFileSync(LEDGER_FILE_PATH, "utf8");
-      const ledgerData = JSON.parse(raw);
-      return res.json(ledgerData);
+    let sheets;
+    try {
+      sheets = getSheetsClient();
+    } catch (authError: any) {
+      return res.status(412).json({
+        error: "AUTHENTICATION_FAILED",
+        message: authError.message,
+      });
     }
-    res.json(null); // Return null if no data has been saved yet
+
+    await ensureLedgerSheetExists(sheets);
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: LEDGER_SPREADSHEET_ID,
+      range: `${LEDGER_SHEET_TAB}!A1`,
+    });
+
+    const raw = result.data.values?.[0]?.[0];
+    if (!raw) {
+      return res.json(null); // No ledger saved yet
+    }
+
+    res.json(JSON.parse(raw));
   } catch (error: any) {
-    console.error("Error reading ledger from server:", error);
+    console.error("Error reading ledger from Google Sheets:", error);
     res.status(500).json({
       error: "LOAD_FAILED",
-      message: error.message || "Failed to load ledger from the server.",
+      message: error.message || "Failed to load ledger from Google Sheets.",
     });
   }
 });
@@ -253,7 +303,7 @@ app.post("/api/sheets/sync", async (req, res) => {
     }
 
     const targetSpreadsheetId = spreadsheetId || "15Mj6A4XAj42T92ddmbgbW-lT6ulgzkc_qx2fHp0YT0c";
-    
+
     // 1. Get authenticated sheets client
     let sheets;
     try {
