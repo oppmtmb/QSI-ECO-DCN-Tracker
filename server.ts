@@ -342,17 +342,26 @@ app.post("/api/sheets/sync", async (req, res) => {
     const headers = ["ECO / ECN ID", "DCN(s)", "Status", "Confidence Rate", "Match Level", "Audit Flag", "Sourced Email ID(s)", "Notes", "เวลาที่บันทึกข้อมูล (Recorded Time)", "Last Synced (Local Time)"];
     const syncTimeStr = localTime || new Date().toLocaleString("th-TH");
 
+    // Google Sheets caps every cell at 50,000 characters. Fields like the sourced email
+    // ID list or notes can grow unbounded, so clamp anything that could exceed the limit
+    // rather than letting the whole sync fail on one oversized row.
+    const SHEETS_CELL_LIMIT = 49000; // safety margin under the hard 50,000 cap
+    const clampCell = (value: string): string => {
+      if (value.length <= SHEETS_CELL_LIMIT) return value;
+      return value.substring(0, SHEETS_CELL_LIMIT) + `…[truncated, ${value.length} chars total]`;
+    };
+
     const rows = matches.map((m: any) => [
-      m.ecoId || "",
-      (m.dcns && m.dcns.join(", ")) || "—",
-      m.status || "OPEN",
+      clampCell(m.ecoId || ""),
+      clampCell((m.dcns && m.dcns.join(", ")) || "—"),
+      clampCell(m.status || "OPEN"),
       `${Math.round((m.confidence || 0) * 100)}%`,
-      m.matchType || "—",
-      m.flag || "—",
-      m.source || "—",
-      m.notes || "—",
-      m.timestamp || "—",
-      syncTimeStr
+      clampCell(m.matchType || "—"),
+      clampCell(m.flag || "—"),
+      clampCell(m.source || "—"),
+      clampCell(m.notes || "—"),
+      clampCell(m.timestamp || "—"),
+      clampCell(syncTimeStr)
     ]);
 
     const values = [headers, ...rows];
