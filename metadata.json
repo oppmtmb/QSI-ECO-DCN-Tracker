@@ -1,0 +1,6 @@
+{
+  "name": "ECO-DCN Email Tracker",
+  "description": "Extract, classify, and track ECO and DCN relationships from manufacturing emails.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
