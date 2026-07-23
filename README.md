@@ -3,6 +3,7 @@
 Automated change-control linking and classification tool for manufacturing quality management. Extracts ECO/DCN codes from customer and internal emails, auto-matches them, and tracks OPEN/CLOSE status in a shared ledger.
 
 > Production Ops v1.4 — QSI Document Control & Quality Management System
+> 🔗 Live app: https://qsi-eco-dcn-tracker.onrender.com/
 
 ## What it does
 
